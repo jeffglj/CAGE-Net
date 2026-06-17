@@ -1,10 +1,43 @@
+"""
+CAGE-Net: Two-View Correspondence Pruning via Cascaded Adaptive
+          Geometry-Enhanced Learning
+================================================================
+Built on the SPD (OANet family) backbone. Four coordinated designs,
+named consistently with the paper:
+
+  PGDA  - Parallel Gated Dual-Axis Attention
+          Parallel Spatial MHSA + Channel MSA fused by an
+          *input-conditioned* gate that adaptively rebalances the two
+          axes per sample/scene. Two parameter-independent PGDA
+          instances bracket GEGR (pgda_pre / pgda_post).
+
+  GEGR  - Geometry-Enhanced Graph Reasoning
+          GCN Block (node-axis aggregation) + CPT module
+          (channel-axis coordinate-conditioned attention + MBFFN).
+
+  LGFE  - Local-Global Feature Enhancement
+          ResNet/GNN/OA backbone with MSDA densely inserted.
+  MSDA  - Multi-Scale Difference Attention (4 branches).
+
+  CSMF  - Cross-Stage Multi-scale Feature Fusion
+          Attention-weighted fusion of stage-0 key-node features,
+          injected into stage 1.
+
+Main network class: CAGENet  (alias FusedCLNet kept for backward
+compatibility with existing training scripts).
+"""
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from loss import batch_episym
 
 
-class trans(nn.Module):
+# ============================================================
+# Basic utilities
+# ============================================================
+
+class Transpose(nn.Module):
     def __init__(self, dim1, dim2):
         nn.Module.__init__(self)
         self.dim1 = dim1
@@ -14,9 +47,9 @@ class trans(nn.Module):
         return x.transpose(self.dim1, self.dim2)
 
 
-class ResNet_Block(nn.Module):
+class ResNetBlock(nn.Module):
     def __init__(self, inchannel, outchannel, pre=False):
-        super(ResNet_Block, self).__init__()
+        super(ResNetBlock, self).__init__()
         self.pre = pre
         self.right = nn.Sequential(
             nn.Conv2d(inchannel, outchannel, (1, 1)),
@@ -73,6 +106,10 @@ def weighted_8points(x_in, logits):
     return e_hat
 
 
+# ============================================================
+# KNN / Graph helpers
+# ============================================================
+
 def knn(x, k):
     inner = -2 * torch.matmul(x.transpose(2, 1), x)
     xx = torch.sum(x ** 2, dim=1, keepdim=True)
@@ -102,6 +139,10 @@ def get_graph_feature(x, k=20, idx=None):
     return feature
 
 
+# ============================================================
+# SPD backbone blocks: OAFilter / diff_pool / diff_unpool / OABlock / GCNBlock
+# ============================================================
+
 class OAFilter(nn.Module):
     def __init__(self, channels, points, out_channels=None):
         nn.Module.__init__(self)
@@ -115,14 +156,14 @@ class OAFilter(nn.Module):
             nn.BatchNorm2d(channels),
             nn.ReLU(),
             nn.Conv2d(channels, out_channels, kernel_size=1),
-            trans(1, 2))
+            Transpose(1, 2))
         self.conv2 = nn.Sequential(
             nn.BatchNorm2d(points),
             nn.ReLU(),
             nn.Conv2d(points, points, kernel_size=1)
         )
         self.conv3 = nn.Sequential(
-            trans(1, 2),
+            Transpose(1, 2),
             nn.InstanceNorm2d(out_channels, eps=1e-3),
             nn.BatchNorm2d(out_channels),
             nn.ReLU(),
@@ -140,7 +181,7 @@ class OAFilter(nn.Module):
         return out
 
 
-class diff_pool(nn.Module):
+class DiffPool(nn.Module):
     def __init__(self, in_channel, output_points):
         nn.Module.__init__(self)
         self.output_points = output_points
@@ -158,7 +199,7 @@ class diff_pool(nn.Module):
         return out
 
 
-class diff_unpool(nn.Module):
+class DiffUnpool(nn.Module):
     def __init__(self, in_channel, output_points):
         nn.Module.__init__(self)
         self.output_points = output_points
@@ -181,11 +222,11 @@ class OABlock(nn.Module):
         channels = net_channels
         self.layer_num = depth
         l2_nums = clusters
-        self.down1 = diff_pool(channels, l2_nums)
+        self.down1 = DiffPool(channels, l2_nums)
         self.l2 = []
         for _ in range(self.layer_num // 2):
             self.l2.append(OAFilter(channels, l2_nums))
-        self.up1 = diff_unpool(channels, l2_nums)
+        self.up1 = DiffUnpool(channels, l2_nums)
         self.l2 = nn.Sequential(*self.l2)
         self.output = nn.Conv2d(channels, 1, kernel_size=1)
         self.shot_cut = nn.Conv2d(channels * 2, channels, kernel_size=1)
@@ -199,10 +240,12 @@ class OABlock(nn.Module):
         return self.shot_cut(out)
 
 
-class GCN_Block(nn.Module):
-
+class GCNBlock(nn.Module):
+    """Global graph convolution (SPD original).
+    Adjacency built from per-point weights under no_grad (intentional
+    regularization, not a bug)."""
     def __init__(self, in_channel):
-        super(GCN_Block, self).__init__()
+        super(GCNBlock, self).__init__()
         self.in_channel = in_channel
         self.conv = nn.Sequential(
             nn.Conv2d(self.in_channel, self.in_channel, (1, 1)),
@@ -237,8 +280,14 @@ class GCN_Block(nn.Module):
         return out
 
 
-class _SpatialMHSA(nn.Module):
+# ============================================================
+# Module 1: PGDA - Parallel Gated Dual-Axis Attention
+#   Spatial MHSA (N x N) || Channel MSA (C x C) with an
+#   input-conditioned gate that adaptively rebalances the two axes.
+# ============================================================
 
+class SpatialMHSA(nn.Module):
+    """Spatial multi-head self-attention: N x N affinity over correspondences."""
     def __init__(self, dim, heads=4, dim_head=32, attn_dropout=0.0, proj_dropout=0.0):
         super().__init__()
         assert heads * dim_head == dim, "heads * dim_head must equal dim"
@@ -260,6 +309,7 @@ class _SpatialMHSA(nn.Module):
         k = k.view(B, N, self.heads, self.dim_head).transpose(1, 2)
         v = v.view(B, N, self.heads, self.dim_head).transpose(1, 2)
 
+        # PyTorch SDPA (enables flash attention, lowers memory)
         if hasattr(F, "scaled_dot_product_attention"):
             out = F.scaled_dot_product_attention(
                 q, k, v,
@@ -279,8 +329,8 @@ class _SpatialMHSA(nn.Module):
         return out
 
 
-class _ChannelMSA(nn.Module):
-
+class ChannelMSA(nn.Module):
+    """Channel attention: C x C cross-covariance affinity (contraction over N)."""
     def __init__(self, dim, heads=4, dim_head=32, attn_dropout=0.0, proj_dropout=0.0):
         super().__init__()
         assert heads * dim_head == dim, "heads * dim_head must equal dim"
@@ -297,34 +347,52 @@ class _ChannelMSA(nn.Module):
         qkv = self.qkv(x)
         q, k, v = qkv.chunk(3, dim=-1)
 
-        q = q.view(B, N, self.heads, self.dim_head).permute(0, 2, 3, 1)
+        q = q.view(B, N, self.heads, self.dim_head).permute(0, 2, 3, 1)  # (B,h,dh,N)
         k = k.view(B, N, self.heads, self.dim_head).permute(0, 2, 3, 1)
         v = v.view(B, N, self.heads, self.dim_head).permute(0, 2, 3, 1)
 
         scale = (N ** -0.5)
-        attn = (q * scale) @ k.transpose(-2, -1)
+        attn = (q * scale) @ k.transpose(-2, -1)  # (B,h,dh,dh) channel attention
         attn = attn.softmax(dim=-1)
         attn = self.attn_drop(attn)
 
-        out = attn @ v
+        out = attn @ v  # (B,h,dh,N)
         out = out.permute(0, 3, 1, 2).contiguous().view(B, N, C)
         out = self.proj(out)
         out = self.proj_drop(out)
         return out
 
 
-class PGDA_Block(nn.Module):
+class PGDABlock(nn.Module):
+    """PGDA unit: PreNorm + parallel (Spatial MHSA || Channel MSA) fused by an
+    input-conditioned gate -> PreNorm + FFN.
 
+    The gate g is predicted per-sample from a global descriptor of the input,
+    so the spatial/channel balance adapts to the scene rather than being a
+    single learned constant shared by all inputs.
+    """
     def __init__(self, dim=128, heads=4, dim_head=32, mlp_ratio=2.0,
                  attn_dropout=0.0, proj_dropout=0.0):
         super().__init__()
         self.norm1 = nn.LayerNorm(dim)
-        self.s_mhsa = _SpatialMHSA(dim, heads, dim_head, attn_dropout, proj_dropout)
+        self.s_mhsa = SpatialMHSA(dim, heads, dim_head, attn_dropout, proj_dropout)
 
         self.norm2 = nn.LayerNorm(dim)
-        self.c_msa = _ChannelMSA(dim, heads, dim_head, attn_dropout, proj_dropout)
+        self.c_msa = ChannelMSA(dim, heads, dim_head, attn_dropout, proj_dropout)
 
-        self.gate = nn.Parameter(torch.tensor(0.5))
+        # ---- Input-conditioned gate ----
+        # Predict a per-sample scalar g from a global feature descriptor.
+        # Replaces the previous single global scalar nn.Parameter(0.5).
+        gate_hidden = max(dim // 4, 8)
+        self.gate_mlp = nn.Sequential(
+            nn.Linear(dim, gate_hidden),
+            nn.GELU(),
+            nn.Linear(gate_hidden, 1),
+        )
+        # Zero-init the last layer so sigmoid(g)=0.5 at the start of training,
+        # exactly reproducing the original scalar-gate initialization point.
+        nn.init.zeros_(self.gate_mlp[-1].weight)
+        nn.init.zeros_(self.gate_mlp[-1].bias)
 
         self.norm3 = nn.LayerNorm(dim)
         hidden = int(dim * mlp_ratio)
@@ -336,43 +404,67 @@ class PGDA_Block(nn.Module):
             nn.Dropout(proj_dropout),
         )
 
-    def forward(self, x):
-        g = torch.sigmoid(self.gate)
-        x = x + g * self.s_mhsa(self.norm1(x)) + (1 - g) * self.c_msa(self.norm2(x))
+    def forward(self, x, return_gate=False):
+        # x: (B, N, C)
+        x_s = self.s_mhsa(self.norm1(x))
+        x_c = self.c_msa(self.norm2(x))
+
+        # Input-conditioned gate: global avg pool over N -> MLP -> per-sample scalar
+        ctx = x.mean(dim=1)                     # (B, C)
+        g = torch.sigmoid(self.gate_mlp(ctx))   # (B, 1)
+        g = g.unsqueeze(1)                      # (B, 1, 1), broadcasts over (B,N,C)
+
+        x = x + g * x_s + (1 - g) * x_c
         x = x + self.ffn(self.norm3(x))
+        if return_gate:
+            return x, g.view(-1)                # g per sample, for visualization
         return x
 
 
-class PGDA_Stack(nn.Module):
-
+class PGDA(nn.Module):
+    """Stacked PGDA blocks. Input/output: (B, C, N, 1)."""
     def __init__(self, dim=128, depth=2, heads=4, dim_head=32, mlp_ratio=2.0,
                  attn_dropout=0.0, proj_dropout=0.0):
         super().__init__()
         self.blocks = nn.ModuleList([
-            PGDA_Block(dim, heads, dim_head, mlp_ratio, attn_dropout, proj_dropout)
+            PGDABlock(dim, heads, dim_head, mlp_ratio, attn_dropout, proj_dropout)
             for _ in range(depth)
         ])
 
-    def forward(self, x):
+    def forward(self, x, return_gate=False):
+        # x: (B,C,N,1) -> (B,N,C) -> stack -> (B,C,N,1)
         x_seq = x.squeeze(-1).transpose(1, 2)
+        gates = []
         for blk in self.blocks:
-            x_seq = blk(x_seq)
-        return x_seq.transpose(1, 2).unsqueeze(-1)
+            if return_gate:
+                x_seq, g = blk(x_seq, return_gate=True)
+                gates.append(g)
+            else:
+                x_seq = blk(x_seq)
+        out = x_seq.transpose(1, 2).unsqueeze(-1)
+        if return_gate:
+            return out, gates
+        return out
 
+
+# ============================================================
+# Module 2: MSDA - Multi-Scale Difference Attention
+#   4 branches: pointwise + global-avg + global-max + local-global diff
+# ============================================================
 
 class MSDA(nn.Module):
-
     def __init__(self, in_channels=128, reduction=4, use_residual=True):
         super(MSDA, self).__init__()
         self.in_channels = in_channels
         self.out_channels = in_channels
-        inter_channels = int(self.in_channels // reduction)
+        inter_channels = int(self.in_channels // reduction)  # 32
 
         self.conv_in = nn.Sequential(
             nn.Conv2d(self.in_channels, self.out_channels, kernel_size=1),
             nn.BatchNorm2d(self.out_channels),
             nn.GELU()
         )
+        # Branch 1: pointwise (local) attention
         self.local_att = nn.Sequential(
             nn.Conv2d(self.out_channels, inter_channels, kernel_size=1),
             nn.BatchNorm2d(inter_channels),
@@ -380,6 +472,7 @@ class MSDA(nn.Module):
             nn.Conv2d(inter_channels, self.out_channels, kernel_size=1),
             nn.BatchNorm2d(self.out_channels),
         )
+        # Branch 2: global average pooling attention
         self.global_att_avg = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),
             nn.Conv2d(self.out_channels, inter_channels, kernel_size=1),
@@ -388,6 +481,7 @@ class MSDA(nn.Module):
             nn.Conv2d(inter_channels, self.out_channels, kernel_size=1),
             nn.BatchNorm2d(self.out_channels),
         )
+        # Branch 3: global max pooling attention (salient responses)
         self.global_att_max = nn.Sequential(
             nn.AdaptiveMaxPool2d(1),
             nn.Conv2d(self.out_channels, inter_channels, kernel_size=1),
@@ -396,6 +490,7 @@ class MSDA(nn.Module):
             nn.Conv2d(inter_channels, self.out_channels, kernel_size=1),
             nn.BatchNorm2d(self.out_channels),
         )
+        # Branch 4: local-global difference branch
         self.global_local_diff = nn.Sequential(
             nn.Conv2d(self.out_channels, inter_channels, kernel_size=1),
             nn.BatchNorm2d(inter_channels),
@@ -404,6 +499,7 @@ class MSDA(nn.Module):
             nn.BatchNorm2d(self.out_channels),
         )
 
+        # Learnable branch weights
         self.branch_weights = nn.Parameter(torch.ones(4) * 0.25)
 
         self.sigmoid = nn.Sigmoid()
@@ -411,13 +507,14 @@ class MSDA(nn.Module):
         self.use_residual = use_residual
 
     def forward(self, x):
+        # x: [B, C, N, 1]
         input_conv = self.conv_in(x)
 
         local_scale = self.local_att(input_conv)
         global_avg_scale = self.global_att_avg(input_conv)
         global_max_scale = self.global_att_max(input_conv)
 
-        global_mean = torch.mean(input_conv, dim=2, keepdim=True)
+        global_mean = torch.mean(input_conv, dim=2, keepdim=True)  # [B,C,1,1]
         diff_feat = input_conv - global_mean
         diff_scale = self.global_local_diff(diff_feat)
 
@@ -428,19 +525,27 @@ class MSDA(nn.Module):
 
         weighted_feat = input_conv * scale_out
         output = self.conv_out(weighted_feat)
-        output = output + input_conv
+        output = output + input_conv  # intra-branch residual
 
         if self.use_residual:
-            output = output + x
+            output = output + x       # cross-branch residual
 
-        return output
+        return output  # [B, C, N, 1]
 
 
-class CPT(nn.Module):
+# ============================================================
+# Module 3 (part): CPT - Coordinate-conditioned channel attention + MBFFN
+# ============================================================
 
+class CPTAttention(nn.Module):
+    """Coordinate-conditioned channel attention.
+    Shared two-view coordinate encoder + relative-displacement encoder;
+    affinity is C x C (contraction over the N correspondences)."""
     def __init__(self, in_channels, out_channels):
-        super(CPT, self).__init__()
+        super(CPTAttention, self).__init__()
+        # Shared coordinate encoder (tied across the two views)
         self.coord_encoder = nn.Conv2d(2, in_channels, kernel_size=1)
+        # Relative-displacement encoder (cross-view motion)
         self.rel_encoder = nn.Conv2d(2, in_channels, kernel_size=1)
 
         self.q = nn.Sequential(
@@ -461,20 +566,26 @@ class CPT(nn.Module):
         self.temperature = torch.sqrt(torch.tensor(float(in_channels)))
         self.temperature2 = torch.sqrt(torch.tensor(float(in_channels)))
 
-    def forward(self, PointCN1, x):
+    def forward(self, feature, coords):
+        """
+        feature: [B,C,N,1]
+        coords:  raw coordinate input [B,4 or 6,N,1] (first 4 channels x1,y1,x2,y2)
+        """
+        q = self.q(feature).squeeze(3)  # [B,C,N]
+        k = self.k(feature).squeeze(3)
+        v = self.v(feature).squeeze(3)
 
-        q = self.q(PointCN1).squeeze(3)
-        k = self.k(PointCN1).squeeze(3)
-        v = self.v(PointCN1).squeeze(3)
+        # Shared encoder on both views + relative displacement
+        coord_1 = coords[:, :2, :, :]   # view A
+        coord_2 = coords[:, 2:4, :, :]  # view B
+        graph_1 = self.coord_encoder(coord_1)            # shared weights
+        graph_2 = self.coord_encoder(coord_2)            # shared weights
+        graph_rel = self.rel_encoder(coord_1 - coord_2)  # relative displacement
+        graph_context = (graph_1 + graph_2 + graph_rel).squeeze(3)  # [B,C,N]
 
-        coord_1 = x[:, :2, :, :]
-        coord_2 = x[:, 2:4, :, :]
-        graph_1 = self.coord_encoder(coord_1)
-        graph_2 = self.coord_encoder(coord_2)
-        graph_rel = self.rel_encoder(coord_1 - coord_2)
-        graph_context = (graph_1 + graph_2 + graph_rel).squeeze(3)
-
-        graph_context_position = torch.matmul(q / self.temperature2, graph_context.transpose(1, 2))
+        # Coordinate-conditioned channel attention (C x C)
+        graph_context_position = torch.matmul(q / self.temperature2,
+                                               graph_context.transpose(1, 2))
         attn = torch.matmul(q / self.temperature, k.transpose(1, 2))
         attn = attn + graph_context_position
         attn = F.softmax(attn, dim=-1)
@@ -483,7 +594,8 @@ class CPT(nn.Module):
 
 
 class MBFFN(nn.Module):
-
+    """Multi-Branch Feed-Forward Network (local + global-avg + global-max),
+    a lightweight channel-refinement FFN sharing MSDA's gating philosophy."""
     def __init__(self, in_channels, out_channels, reduction=4):
         super(MBFFN, self).__init__()
         inter_channels = int(in_channels // reduction)
@@ -531,32 +643,42 @@ class MBFFN(nn.Module):
         return out
 
 
-class CGA_Module(nn.Module):
-
+class CPT(nn.Module):
+    """CPT module: coordinate-conditioned channel attention + LayerNorm + MBFFN + LayerNorm."""
     def __init__(self, channels):
-        super(CGA_Module, self).__init__()
-        self.CPA = CPT(channels, channels)
+        super(CPT, self).__init__()
+        self.attn = CPTAttention(channels, channels)
         self.LayerNorm1 = nn.LayerNorm(channels, eps=1e-6)
-        self.MBFFN = MBFFN(channels, channels)
+        self.mbffn = MBFFN(channels, channels)
         self.LayerNorm2 = nn.LayerNorm(channels, eps=1e-6)
 
-    def forward(self, feature, position_feature):
-
-        CPT_feature = self.CPA(feature, position_feature)
-        CPT_feature = CPT_feature + feature
-        CPT_feature_LN1 = CPT_feature.squeeze(3).transpose(-1, -2)
-        CPT_feature_LN1 = self.LayerNorm1(CPT_feature_LN1)
-        CPT_feature_LN1 = CPT_feature_LN1.transpose(-1, -2).unsqueeze(3)
-        MBFFN_feature = self.MBFFN(CPT_feature_LN1)
-        MBFFN_feature_LN2 = MBFFN_feature.squeeze(3).transpose(-1, -2)
-        MBFFN_feature_LN2 = self.LayerNorm2(MBFFN_feature_LN2)
-        MBFFN_feature_LN2 = MBFFN_feature_LN2.transpose(-1, -2).unsqueeze(3)
-        out = CPT_feature_LN1 + MBFFN_feature_LN2
+    def forward(self, feature, coords):
+        """
+        feature: deep feature [B,C,N,1]
+        coords:  raw coordinate input [B,4 or 6,N,1]
+        """
+        attn_feature = self.attn(feature, coords)
+        attn_feature = attn_feature + feature
+        # LayerNorm 1
+        ln1 = attn_feature.squeeze(3).transpose(-1, -2)
+        ln1 = self.LayerNorm1(ln1)
+        ln1 = ln1.transpose(-1, -2).unsqueeze(3)
+        # MBFFN
+        mbffn_feature = self.mbffn(ln1)
+        # LayerNorm 2
+        ln2 = mbffn_feature.squeeze(3).transpose(-1, -2)
+        ln2 = self.LayerNorm2(ln2)
+        ln2 = ln2.transpose(-1, -2).unsqueeze(3)
+        # residual
+        out = ln1 + ln2
         return out
 
 
-class MLPs(nn.Module):
+# ============================================================
+# LGFE sub-modules: MLPs / AFF / GNN
+# ============================================================
 
+class MLPs(nn.Module):
     def __init__(self, channels, out_channels=None):
         nn.Module.__init__(self)
         self.conv = nn.Sequential(
@@ -571,7 +693,7 @@ class MLPs(nn.Module):
 
 
 class AFF(nn.Module):
-
+    """Attentional Feature Fusion with a learnable scale."""
     def __init__(self, channels=64, r=4):
         super(AFF, self).__init__()
         inter_channels = int(channels // r)
@@ -605,7 +727,8 @@ class AFF(nn.Module):
 
 
 class GNN(nn.Module):
-
+    """Enhanced Graph Neural Network: ring-conv aggregation + max aggregation,
+    fused by AFF, plus input residual."""
     def __init__(self, knn_num=9, in_channel=128):
         super(GNN, self).__init__()
         self.knn_num = knn_num
@@ -647,23 +770,38 @@ class GNN(nn.Module):
         return out
 
 
-class GEGR(nn.Module):
+# ============================================================
+# Module 3: GEGR - Geometry-Enhanced Graph Reasoning
+#   GCN Block (node axis) + CPT module (channel axis, coordinate-conditioned)
+# ============================================================
 
+class GEGR(nn.Module):
+    """feature -> GCN(feature, weight) + residual -> CPT(feature, coords) -> output.
+    Also returns the GCN-stage feature (for cross-stage fusion)."""
     def __init__(self, channels):
         super(GEGR, self).__init__()
-        self.gcn = GCN_Block(channels)
-        self.cga = CGA_Module(channels)
+        self.gcn = GCNBlock(channels)
+        self.cpt = CPT(channels)
 
-    def forward(self, feature, weight, position_feature):
-
+    def forward(self, feature, weight, coords):
+        """
+        feature: [B,C,N,1]
+        weight:  [B,N] (for GCN adjacency)
+        coords:  [B,4 or 6,N,1] (for coordinate encoding)
+        returns: (output, gcn_out)
+        """
         out_g = self.gcn(feature, weight)
         out_gcn = out_g + feature
-        out = self.cga(out_gcn, position_feature)
+        out = self.cpt(out_gcn, coords)
         return out, out_gcn
 
 
-class CSMF(nn.Module):
+# ============================================================
+# Module 4: CSMF - Cross-Stage Multi-scale Feature Fusion
+# ============================================================
 
+class CSMF(nn.Module):
+    """Attention-weighted fusion of stage-0 key-node features, injected into stage 1."""
     def __init__(self, channels=128, num_keys=3):
         super(CSMF, self).__init__()
         self.substage_att = nn.ModuleList([
@@ -681,7 +819,7 @@ class CSMF(nn.Module):
         )
 
     def forward(self, key_outs):
-
+        """key_outs: list of [B,C,N,1]; returns [B,C,N,1]."""
         weights = [att(feat) for att, feat in zip(self.substage_att, key_outs)]
         weights_sum = sum(weights) + 1e-8
         norm_weights = [w / weights_sum for w in weights]
@@ -689,10 +827,15 @@ class CSMF(nn.Module):
         return self.conv_adjust(fused)
 
 
-class DS_Block(nn.Module):
+# ============================================================
+# CAGEStage: one pruning stage integrating LGFE + PGDA + GEGR (+ CSMF input)
+# ============================================================
+
+class CAGEStage(nn.Module):
     def __init__(self, initial=False, predict=False, out_channel=128, k_num=8,
-                 sampling_rate=0.5, pgda_depth=2, cross_stage=False):
-        super(DS_Block, self).__init__()
+                 sampling_rate=0.5, pgda_depth=2, cross_stage=False,
+                 use_pgda=True, use_msda=True, use_gegr=True):
+        super(CAGEStage, self).__init__()
         self.initial = initial
         self.in_channel = 4 if self.initial is True else 6
         self.out_channel = out_channel
@@ -700,66 +843,75 @@ class DS_Block(nn.Module):
         self.predict = predict
         self.sr = sampling_rate
         self.cross_stage = cross_stage
+        self.use_pgda = use_pgda
+        self.use_gegr = use_gegr
 
+        # ---- input encoding ----
         self.conv = nn.Sequential(
             nn.Conv2d(self.in_channel, self.out_channel, (1, 1)),
             nn.BatchNorm2d(self.out_channel),
             nn.ReLU(inplace=True)
         )
 
-        self.embed_0 = nn.Sequential(
-            ResNet_Block(self.out_channel, self.out_channel, pre=False),
-            ResNet_Block(self.out_channel, self.out_channel, pre=False),
+        # ---- LGFE (first half): ResNet x2 -> GNN -> MSDA -> ResNet x2 -> MSDA
+        #                         -> OABlock -> MSDA -> ResNet x2 ----
+        self.lgfe_pre = nn.Sequential(
+            ResNetBlock(self.out_channel, self.out_channel, pre=False),
+            ResNetBlock(self.out_channel, self.out_channel, pre=False),
             GNN(int(self.k_num), self.out_channel),
-            MSDA(in_channels=self.out_channel),
-            ResNet_Block(self.out_channel, self.out_channel, pre=False),
-            ResNet_Block(self.out_channel, self.out_channel, pre=False),
-            MSDA(in_channels=self.out_channel),
+            MSDA(in_channels=self.out_channel) if use_msda else nn.Identity(),
+            ResNetBlock(self.out_channel, self.out_channel, pre=False),
+            ResNetBlock(self.out_channel, self.out_channel, pre=False),
+            MSDA(in_channels=self.out_channel) if use_msda else nn.Identity(),
             OABlock(self.out_channel, clusters=256),
-            MSDA(in_channels=self.out_channel),
-            ResNet_Block(self.out_channel, self.out_channel, pre=False),
-            ResNet_Block(self.out_channel, self.out_channel, pre=False),
+            MSDA(in_channels=self.out_channel) if use_msda else nn.Identity(),
+            ResNetBlock(self.out_channel, self.out_channel, pre=False),
+            ResNetBlock(self.out_channel, self.out_channel, pre=False),
         )
 
-        self.pgda_pre = PGDA_Stack(
-            dim=self.out_channel,
-            depth=pgda_depth,
-            heads=4,
-            dim_head=32,
-            mlp_ratio=2.0,
-            attn_dropout=0.0,
-            proj_dropout=0.0,
-        )
-        self.pgda_post = PGDA_Stack(
-            dim=self.out_channel,
-            depth=pgda_depth,
-            heads=4,
-            dim_head=32,
-            mlp_ratio=2.0,
-            attn_dropout=0.0,
-            proj_dropout=0.0,
-        )
+        # ---- PGDA (pre / post around GEGR) ----
+        if use_pgda:
+            self.pgda_pre = PGDA(
+                dim=self.out_channel, depth=pgda_depth, heads=4, dim_head=32,
+                mlp_ratio=2.0, attn_dropout=0.0, proj_dropout=0.0,
+            )
+            self.pgda_post = PGDA(
+                dim=self.out_channel, depth=pgda_depth, heads=4, dim_head=32,
+                mlp_ratio=2.0, attn_dropout=0.0, proj_dropout=0.0,
+            )
+        else:
+            self.pgda_pre = None
+            self.pgda_post = None
 
+        # ---- weight prediction w0 ----
         self.linear_0 = nn.Conv2d(self.out_channel, 1, (1, 1))
 
-        self.gegr = GEGR(self.out_channel)
+        # ---- GEGR ----
+        if use_gegr:
+            self.gegr = GEGR(self.out_channel)
+        else:
+            self.gegr = None
 
-        self.embed_1 = nn.Sequential(
-            ResNet_Block(self.out_channel, self.out_channel, pre=False),
-            ResNet_Block(self.out_channel, self.out_channel, pre=False),
+        # ---- LGFE (second half): ResNet x2 -> OABlock -> MSDA -> ResNet x2
+        #                          -> MSDA -> GNN -> MSDA -> ResNet x2 ----
+        self.lgfe_post = nn.Sequential(
+            ResNetBlock(self.out_channel, self.out_channel, pre=False),
+            ResNetBlock(self.out_channel, self.out_channel, pre=False),
             OABlock(self.out_channel, clusters=128),
-            MSDA(in_channels=self.out_channel),
-            ResNet_Block(self.out_channel, self.out_channel, pre=False),
-            ResNet_Block(self.out_channel, self.out_channel, pre=False),
-            MSDA(in_channels=self.out_channel),
+            MSDA(in_channels=self.out_channel) if use_msda else nn.Identity(),
+            ResNetBlock(self.out_channel, self.out_channel, pre=False),
+            ResNetBlock(self.out_channel, self.out_channel, pre=False),
+            MSDA(in_channels=self.out_channel) if use_msda else nn.Identity(),
             GNN(int(self.k_num), self.out_channel),
-            MSDA(in_channels=self.out_channel),
-            ResNet_Block(self.out_channel, self.out_channel, pre=False),
-            ResNet_Block(self.out_channel, self.out_channel, pre=False),
+            MSDA(in_channels=self.out_channel) if use_msda else nn.Identity(),
+            ResNetBlock(self.out_channel, self.out_channel, pre=False),
+            ResNetBlock(self.out_channel, self.out_channel, pre=False),
         )
 
+        # ---- weight prediction w1 ----
         self.linear_1 = nn.Conv2d(self.out_channel, 1, (1, 1))
 
+        # ---- cross-stage fusion input (stage 1 receives stage-0 features) ----
         if self.cross_stage:
             self.cross_key_fuse = nn.Sequential(
                 nn.Conv2d(self.out_channel * 2, self.out_channel, (1, 1)),
@@ -767,8 +919,9 @@ class DS_Block(nn.Module):
                 nn.ReLU(inplace=True),
             )
 
+        # ---- prediction branch ----
         if self.predict == True:
-            self.embed_2 = ResNet_Block(self.out_channel, self.out_channel, pre=False)
+            self.embed_2 = ResNetBlock(self.out_channel, self.out_channel, pre=False)
             self.linear_2 = nn.Conv2d(self.out_channel, 2, (1, 1))
 
     def down_sampling(self, x, y, weights, indices, features=None, predict=False):
@@ -793,32 +946,49 @@ class DS_Block(nn.Module):
             return x_out, y_out, w_out, feature_out
 
     def forward(self, x, y, cross_key_outs=None):
-
+        """
+        x: [B,1,N,4] or [B,1,N,6]
+        y: [B,N] labels
+        cross_key_outs: [B,128,N,1] CSMF feature (stage 1 only)
+        """
         B, _, N, _ = x.size()
-        x_raw = x.transpose(1, 3).contiguous()
+        x_raw = x.transpose(1, 3).contiguous()  # [B,4 or 6,N,1]
 
-        out = self.conv(x_raw)
+        out = self.conv(x_raw)  # [B,128,N,1]
 
+        # CSMF: stage 1 receives stage-0 multi-scale feature
         if cross_key_outs is not None and self.cross_stage:
             out = out + self.cross_key_fuse(torch.cat([out, cross_key_outs], dim=1))
 
-        out1 = out
+        out1 = out  # key feature #1: conv output (with cross-stage fusion)
 
-        out = self.embed_0(out)
+        # LGFE first half
+        out = self.lgfe_pre(out)
 
-        out = self.pgda_pre(out)
+        # PGDA_pre
+        if self.pgda_pre is not None:
+            out = self.pgda_pre(out)
 
+        # w0
         w0 = self.linear_0(out).view(B, -1)
 
-        out, out2 = self.gegr(out, w0.detach(), x_raw)
+        # GEGR
+        if self.gegr is not None:
+            out, out2 = self.gegr(out, w0.detach(), x_raw)
+        else:
+            out2 = out
 
-        out = self.pgda_post(out)
+        # PGDA_post
+        if self.pgda_post is not None:
+            out = self.pgda_post(out)
 
-        out = self.embed_1(out)
+        # LGFE second half
+        out = self.lgfe_post(out)
 
+        # w1
         w1 = self.linear_1(out).view(B, -1)
 
-        out3 = out
+        out3 = out  # key feature #3: LGFE-post output
 
         if self.predict == False:
             w1_ds, indices = torch.sort(w1, dim=-1, descending=True)
@@ -843,44 +1013,74 @@ class DS_Block(nn.Module):
             return x_ds, y_ds, [w0, w1, w2[:, 0, :, 0]], [w0_ds, w1_ds], e_hat
 
 
+# ============================================================
+# CAGENet: two-stage progressive pruning (PGDA + MSDA/LGFE + GEGR + CSMF)
+# ============================================================
+
 class CAGENet(nn.Module):
     def __init__(self, config):
         super(CAGENet, self).__init__()
 
-        self.ds_0 = DS_Block(
+        # Stage 0: N=2000 -> N=1000
+        self.ds_0 = CAGEStage(
             initial=True, predict=False,
             out_channel=128,
             k_num=9,
             sampling_rate=config.sr,
             pgda_depth=2,
             cross_stage=False,
+            use_pgda=getattr(config, 'use_pgda', True),
+            use_msda=getattr(config, 'use_msda', True),
+            use_gegr=getattr(config, 'use_gegr', True),
         )
 
-        self.ds_1 = DS_Block(
+        # Stage 1: N=1000 -> N=500
+        self.ds_1 = CAGEStage(
             initial=False, predict=True,
             out_channel=128,
             k_num=6,
             sampling_rate=config.sr,
             pgda_depth=2,
-            cross_stage=True,
+            cross_stage=getattr(config, 'use_csmf', True),
+            use_pgda=getattr(config, 'use_pgda', True),
+            use_msda=getattr(config, 'use_msda', True),
+            use_gegr=getattr(config, 'use_gegr', True),
         )
 
-        self.csmf = CSMF(channels=128, num_keys=3)
+        # CSMF: cross-stage multi-scale fusion
+        if getattr(config, 'use_csmf', True):
+            self.csmf = CSMF(channels=128, num_keys=3)
+        else:
+            self.csmf = None
 
     def forward(self, x, y):
+        # x[B,1,2000,4], y[B,2000]
         B, _, N, _ = x.shape
 
+        # Stage 0 (returns key_outs)
         x1, y1, ws0, w_ds0, key_outs_ds0 = self.ds_0(x, y)
 
-        ds0_all_feat = self.csmf(key_outs_ds0)
+        # CSMF
+        if self.csmf is not None:
+            ds0_all_feat = self.csmf(key_outs_ds0)
+        else:
+            ds0_all_feat = None
 
+        # normalize weights and concat for stage 1
         w_ds0[0] = torch.relu(torch.tanh(w_ds0[0])).reshape(B, 1, -1, 1)
         w_ds0[1] = torch.relu(torch.tanh(w_ds0[1])).reshape(B, 1, -1, 1)
         x_ = torch.cat([x1, w_ds0[0].detach(), w_ds0[1].detach()], dim=-1)
 
+        # Stage 1 (receives CSMF feature)
         x2, y2, ws1, w_ds1, e_hat = self.ds_1(x_, y1, cross_key_outs=ds0_all_feat)
 
         with torch.no_grad():
             y_hat = batch_episym(x[:, 0, :, :2], x[:, 0, :, 2:], e_hat)
 
         return ws0 + ws1, [y, y, y1, y1, y2], [e_hat], y_hat
+
+
+# ------------------------------------------------------------
+# Backward-compatible alias (existing training scripts import FusedCLNet)
+# ------------------------------------------------------------
+FusedCLNet = CAGENet

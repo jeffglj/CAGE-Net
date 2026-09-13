@@ -1,41 +1,9 @@
-"""
-CAGE-Net: Two-View Correspondence Pruning via Cascaded Adaptive
-          Geometry-Enhanced Learning
-================================================================
-Built on the SPD (OANet family) backbone. Four coordinated designs:
-
-  CGCA-RS - Conflict-Gated Coherence Attention with Reliability Stabilization
-          Upgrades PGDA by treating local consensus as a hypothesis that must
-          be verified by global epipolar compatibility. The post-GEGR path uses
-          the learned w0 confidence as a weak certification seed to stabilize
-          in-module E estimation on pseudo-consensus-heavy indoor scenes.
-
-  GEGR  - Geometry-Enhanced Graph Reasoning
-          GCN Block (node-axis aggregation) + CPT module
-          (channel-axis coordinate-conditioned attention + MBFFN).
-
-  LGFE  - Local-Global Feature Enhancement
-          ResNet/GNN/OA backbone with MSDA densely inserted.
-          
-  MSDA  - Multi-Scale Difference Attention (4 branches).
-
-  CSMF  - Cross-Stage Multi-scale Feature Fusion
-          Attention-weighted fusion of stage-0 key-node features,
-          injected into stage 1.
-
-Main network class: CAGENet  (alias FusedCLNet kept for backward
-compatibility with existing training scripts).
-"""
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from loss import batch_episym
 
-
-# ============================================================
-# Basic utilities
-# ============================================================
 
 class Transpose(nn.Module):
     def __init__(self, dim1, dim2):
@@ -107,10 +75,6 @@ def weighted_8points(x_in, logits):
     return e_hat
 
 
-# ============================================================
-# KNN / Graph helpers
-# ============================================================
-
 def knn(x, k):
     inner = -2 * torch.matmul(x.transpose(2, 1), x)
     xx = torch.sum(x ** 2, dim=1, keepdim=True)
@@ -139,10 +103,6 @@ def get_graph_feature(x, k=20, idx=None):
     feature = torch.cat((x, x - feature), dim=3).permute(0, 3, 1, 2).contiguous()
     return feature
 
-
-# ============================================================
-# SPD backbone blocks
-# ============================================================
 
 class OAFilter(nn.Module):
     def __init__(self, channels, points, out_channels=None):
@@ -252,21 +212,17 @@ class GCNBlock(nn.Module):
         )
 
     def attention(self, w):
-        w = torch.relu(torch.tanh(w)).unsqueeze(-1)
-        A = torch.bmm(w.transpose(1, 2), w)
-        return A
+        reliability = torch.relu(torch.tanh(w)).unsqueeze(-1)
+        return torch.bmm(reliability, reliability.transpose(1, 2))
 
     def graph_aggregation(self, x, w):
         B, _, N, _ = x.size()
         with torch.no_grad():
             A = self.attention(w)
-            I = torch.eye(N).unsqueeze(0).to(x.device).detach()
+            I = torch.eye(N, device=x.device, dtype=A.dtype).unsqueeze(0)
             A = A + I
-            D_out = torch.sum(A, dim=-1)
-            D = (1 / D_out) ** 0.5
-            D = torch.diag_embed(D)
-            L = torch.bmm(D, A)
-            L = torch.bmm(L, D)
+            degree_inv_sqrt = A.sum(dim=-1).clamp_min(1e-12).rsqrt()
+            L = degree_inv_sqrt.unsqueeze(-1) * A * degree_inv_sqrt.unsqueeze(-2)
         out = x.squeeze(-1).transpose(1, 2).contiguous()
         out = torch.bmm(L, out).unsqueeze(-1)
         out = out.transpose(1, 2).contiguous()
@@ -278,16 +234,7 @@ class GCNBlock(nn.Module):
         return out
 
 
-# ============================================================
-# Module 1: CGCA-RS - Original CGCA with Reliability Stabilization
-#   Restores the original CGCA carrier that gave the strongest YFCC curve,
-#   and adds only a minimal SUN3D-oriented stabilizer:
-#     1) non-zero bounded conflict gain, so the conflict branch can learn;
-#     2) post-GEGR seed certification for the in-module E weights.
-# ============================================================
-
 class ConflictGatedAttention(nn.Module):
-    """Original CGCA attention with a bounded reliability-stabilized E seed."""
     def __init__(self, dim, heads=4, dim_head=32,
                  attn_dropout=0.0, proj_dropout=0.0,
                  fuse_gain_init=0.01, fuse_gain_max=0.05,
@@ -478,7 +425,6 @@ class CGCABlock(nn.Module):
 
 
 class PGDA(nn.Module):
-    """CGCA-RS drop-in replacement for PGDA. Input/output: (B, C, N, 1)."""
     def __init__(self, dim=128, depth=2, heads=4, dim_head=32, mlp_ratio=2.0,
                  attn_dropout=0.0, proj_dropout=0.0, gate_mode='input',
                  topk_ratio=0.5, k=9, state_chunk=128, min_seed_k=32,
@@ -518,10 +464,6 @@ class PGDA(nn.Module):
             return out, gates
         return out
 
-
-# ============================================================
-# Module 2: MSDA - Multi-Scale Difference Attention
-# ============================================================
 
 class MSDA(nn.Module):
     def __init__(self, in_channels=128, reduction=4, use_residual=True):
@@ -597,10 +539,6 @@ class MSDA(nn.Module):
         return output
 
 
-# ============================================================
-# Module 3 (part): CPT - Coordinate-conditioned channel attention + MBFFN
-# ============================================================
-
 class CPTAttention(nn.Module):
     def __init__(self, in_channels, out_channels, use_rel=True):
         super(CPTAttention, self).__init__()
@@ -608,7 +546,7 @@ class CPTAttention(nn.Module):
 
         self.coord_encoder = nn.Conv2d(2, in_channels, kernel_size=1)
         if self.use_rel:
-            self.rel_encoder = nn.Conv2d(2, in_channels, kernel_size=1)
+            self.rel_encoder = nn.Conv2d(in_channels, in_channels, kernel_size=1)
         else:
             self.rel_encoder = None
 
@@ -641,7 +579,7 @@ class CPTAttention(nn.Module):
         graph_2 = self.coord_encoder(coord_2)
         graph_context = graph_1 + graph_2
         if self.use_rel:
-            graph_context = graph_context + self.rel_encoder(coord_1 - coord_2)
+            graph_context = graph_context + self.rel_encoder(graph_1 - graph_2)
         graph_context = graph_context.squeeze(3)
 
         graph_context_position = torch.matmul(q / self.temperature2, graph_context.transpose(1, 2))
@@ -709,24 +647,16 @@ class CPT(nn.Module):
         self.LayerNorm2 = nn.LayerNorm(channels, eps=1e-6)
 
     def forward(self, feature, coords):
-        attn_feature = self.attn(feature, coords)
-        attn_feature = attn_feature + feature
-        ln1 = attn_feature.squeeze(3).transpose(-1, -2)
-        ln1 = self.LayerNorm1(ln1)
-        ln1 = ln1.transpose(-1, -2).unsqueeze(3)
-        
-        mbffn_feature = self.mbffn(ln1)
-        
-        ln2 = mbffn_feature.squeeze(3).transpose(-1, -2)
-        ln2 = self.LayerNorm2(ln2)
-        ln2 = ln2.transpose(-1, -2).unsqueeze(3)
-        out = ln1 + ln2
+        attn_response = self.attn(feature, coords)
+
+        z1 = (attn_response + feature).squeeze(3).transpose(-1, -2)
+        z1 = self.LayerNorm1(z1).transpose(-1, -2).unsqueeze(3)
+
+        z2 = self.mbffn(z1)
+        out = (z2 + attn_response).squeeze(3).transpose(-1, -2)
+        out = self.LayerNorm2(out).transpose(-1, -2).unsqueeze(3)
         return out
 
-
-# ============================================================
-# LGFE sub-modules: MLPs / AFF / GNN
-# ============================================================
 
 class MLPs(nn.Module):
     def __init__(self, channels, out_channels=None):
@@ -816,10 +746,6 @@ class GNN(nn.Module):
         return out
 
 
-# ============================================================
-# Module 3: GEGR - Geometry-Enhanced Graph Reasoning
-# ============================================================
-
 class GEGR(nn.Module):
     def __init__(self, channels, use_rel=True):
         super(GEGR, self).__init__()
@@ -832,10 +758,6 @@ class GEGR(nn.Module):
         out = self.cpt(out_gcn, coords)
         return out, out_gcn
 
-
-# ============================================================
-# Module 4: CSMF - Cross-Stage Multi-scale Feature Fusion
-# ============================================================
 
 class CSMF(nn.Module):
     def __init__(self, channels=128, num_keys=3):
@@ -861,10 +783,6 @@ class CSMF(nn.Module):
         fused = sum(feat * w for feat, w in zip(key_outs, norm_weights))
         return self.conv_adjust(fused)
 
-
-# ============================================================
-# CAGEStage: one pruning stage integrating LGFE + PGDA + GEGR (+ CSMF input)
-# ============================================================
 
 class CAGEStage(nn.Module):
     def __init__(self, initial=False, predict=False, out_channel=128, k_num=8,
@@ -978,14 +896,14 @@ class CAGEStage(nn.Module):
 
     def forward(self, x, y, cross_key_outs=None, return_gate=False):
         B, _, N, _ = x.size()
-        x_raw = x.transpose(1, 3).contiguous() 
+        x_raw = x.transpose(1, 3).contiguous()
 
-        out = self.conv(x_raw) 
+        out = self.conv(x_raw)
 
         if cross_key_outs is not None and self.cross_stage:
             out = out + self.cross_key_fuse(torch.cat([out, cross_key_outs], dim=1))
 
-        out1 = out 
+        out1 = out
 
         out = self.lgfe_pre(out)
         gates = {}
@@ -1019,7 +937,7 @@ class CAGEStage(nn.Module):
 
         out = self.lgfe_post(out)
         w1 = self.linear_1(out).view(B, -1)
-        out3 = out 
+        out3 = out
 
         if self.predict == False:
             w1_ds, indices = torch.sort(w1, dim=-1, descending=True)
@@ -1048,10 +966,6 @@ class CAGEStage(nn.Module):
             return x_ds, y_ds, [w0, w1, w2[:, 0, :, 0]], [w0_ds, w1_ds], e_hat
 
 
-# ============================================================
-# CAGENet
-# ============================================================
-
 class CAGENet(nn.Module):
     def __init__(self, config):
         super(CAGENet, self).__init__()
@@ -1062,8 +976,7 @@ class CAGENet(nn.Module):
         use_csmf = getattr(config, 'use_csmf', True)
         use_rel = getattr(config, 'use_rel', True)
         gate_mode = getattr(config, 'gate_mode', 'input')
-        
-        # 默认锁定 2 层 PGDA 块（共 8 块），优先贴近原版 SOTA 感受野。
+
         pgda_depth = max(2, int(getattr(config, 'pgda_depth', 2)))
         pgda_state_chunk = getattr(config, 'pgda_state_chunk', 128)
 
@@ -1135,7 +1048,4 @@ class CAGENet(nn.Module):
         return ws0 + ws1, [y, y, y1, y1, y2], [e_hat], y_hat
 
 
-# ------------------------------------------------------------
-# Backward-compatible alias
-# ------------------------------------------------------------
 FusedCLNet = CAGENet

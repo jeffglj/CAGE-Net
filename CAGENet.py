@@ -234,7 +234,7 @@ class GCNBlock(nn.Module):
         return out
 
 
-class ConflictGatedAttention(nn.Module):
+class ConsistencyGuidedCalibrationAttention(nn.Module):
     def __init__(self, dim, heads=4, dim_head=32,
                  attn_dropout=0.0, proj_dropout=0.0,
                  fuse_gain_init=0.01, fuse_gain_max=0.05,
@@ -396,7 +396,7 @@ class CGCABlock(nn.Module):
                  attn_dropout=0.0, proj_dropout=0.0):
         super().__init__()
         self.norm1 = nn.LayerNorm(dim)
-        self.attn = ConflictGatedAttention(
+        self.attn = ConsistencyGuidedCalibrationAttention(
             dim, heads, dim_head, attn_dropout, proj_dropout)
         self.norm2 = nn.LayerNorm(dim)
         hidden = int(dim * mlp_ratio)
@@ -424,11 +424,9 @@ class CGCABlock(nn.Module):
         return x
 
 
-class PGDA(nn.Module):
+class CGCA(nn.Module):
     def __init__(self, dim=128, depth=2, heads=4, dim_head=32, mlp_ratio=2.0,
-                 attn_dropout=0.0, proj_dropout=0.0, gate_mode='input',
-                 topk_ratio=0.5, k=9, state_chunk=128, min_seed_k=32,
-                 state_gain_max=0.05):
+                 attn_dropout=0.0, proj_dropout=0.0):
         super().__init__()
         self.blocks = nn.ModuleList([
             CGCABlock(dim, heads, dim_head, mlp_ratio, attn_dropout, proj_dropout)
@@ -786,9 +784,9 @@ class CSMF(nn.Module):
 
 class CAGEStage(nn.Module):
     def __init__(self, initial=False, predict=False, out_channel=128, k_num=8,
-                 sampling_rate=0.5, pgda_depth=2, cross_stage=False,
-                 use_pgda=True, use_msda=True, use_gegr=True,
-                 use_rel=True, gate_mode='input', pgda_state_chunk=128):
+                 sampling_rate=0.5, cgca_depth=2, cross_stage=False,
+                 use_cgca=True, use_cgca_pre=True, use_cgca_post=True,
+                 use_msda=True, use_gegr=True, use_rel=True):
         super(CAGEStage, self).__init__()
         self.initial = initial
         self.in_channel = 4 if self.initial is True else 6
@@ -797,7 +795,7 @@ class CAGEStage(nn.Module):
         self.predict = predict
         self.sr = sampling_rate
         self.cross_stage = cross_stage
-        self.use_pgda = use_pgda
+        self.use_cgca = use_cgca
         self.use_gegr = use_gegr
         self.use_pre_global_evidence = True
         self.use_post_global_evidence = True
@@ -822,22 +820,14 @@ class CAGEStage(nn.Module):
             ResNetBlock(self.out_channel, self.out_channel, pre=False),
         )
 
-        if use_pgda:
-            self.pgda_pre = PGDA(
-                dim=self.out_channel, depth=pgda_depth, heads=4, dim_head=32,
-                mlp_ratio=2.0, attn_dropout=0.0, proj_dropout=0.0,
-                gate_mode=gate_mode,
-                state_chunk=pgda_state_chunk,
-            )
-            self.pgda_post = PGDA(
-                dim=self.out_channel, depth=pgda_depth, heads=4, dim_head=32,
-                mlp_ratio=2.0, attn_dropout=0.0, proj_dropout=0.0,
-                gate_mode=gate_mode,
-                state_chunk=pgda_state_chunk,
-            )
-        else:
-            self.pgda_pre = None
-            self.pgda_post = None
+        self.cgca_pre = CGCA(
+            dim=self.out_channel, depth=cgca_depth, heads=4, dim_head=32,
+            mlp_ratio=2.0, attn_dropout=0.0, proj_dropout=0.0,
+        ) if use_cgca and use_cgca_pre else None
+        self.cgca_post = CGCA(
+            dim=self.out_channel, depth=cgca_depth, heads=4, dim_head=32,
+            mlp_ratio=2.0, attn_dropout=0.0, proj_dropout=0.0,
+        ) if use_cgca and use_cgca_post else None
 
         self.linear_0 = nn.Conv2d(self.out_channel, 1, (1, 1))
 
@@ -908,15 +898,15 @@ class CAGEStage(nn.Module):
         out = self.lgfe_pre(out)
         gates = {}
 
-        if self.pgda_pre is not None:
-            self.pgda_pre.coords = x_raw
-            self.pgda_pre.seed_score = None
-            self.pgda_pre.use_global_evidence = self.use_pre_global_evidence
+        if self.cgca_pre is not None:
+            self.cgca_pre.coords = x_raw
+            self.cgca_pre.seed_score = None
+            self.cgca_pre.use_global_evidence = self.use_pre_global_evidence
             if return_gate:
-                out, g_pre = self.pgda_pre(out, return_gate=True)
+                out, g_pre = self.cgca_pre(out, return_gate=True)
                 gates['pre'] = g_pre
             else:
-                out = self.pgda_pre(out)
+                out = self.cgca_pre(out)
 
         w0 = self.linear_0(out).view(B, -1)
 
@@ -925,15 +915,15 @@ class CAGEStage(nn.Module):
         else:
             out2 = out
 
-        if self.pgda_post is not None:
-            self.pgda_post.coords = x_raw
-            self.pgda_post.seed_score = w0.detach()
-            self.pgda_post.use_global_evidence = self.use_post_global_evidence
+        if self.cgca_post is not None:
+            self.cgca_post.coords = x_raw
+            self.cgca_post.seed_score = w0.detach()
+            self.cgca_post.use_global_evidence = self.use_post_global_evidence
             if return_gate:
-                out, g_post = self.pgda_post(out, return_gate=True)
+                out, g_post = self.cgca_post(out, return_gate=True)
                 gates['post'] = g_post
             else:
-                out = self.pgda_post(out)
+                out = self.cgca_post(out)
 
         out = self.lgfe_post(out)
         w1 = self.linear_1(out).view(B, -1)
@@ -970,29 +960,29 @@ class CAGENet(nn.Module):
     def __init__(self, config):
         super(CAGENet, self).__init__()
 
-        use_pgda = getattr(config, 'use_pgda', True)
+        use_cgca = getattr(config, 'use_cgca', True)
+        use_cgca_pre = getattr(config, 'use_cgca_pre', True)
+        use_cgca_post = getattr(config, 'use_cgca_post', True)
         use_msda = getattr(config, 'use_msda', True)
         use_gegr = getattr(config, 'use_gegr', True)
         use_csmf = getattr(config, 'use_csmf', True)
         use_rel = getattr(config, 'use_rel', True)
-        gate_mode = getattr(config, 'gate_mode', 'input')
 
-        pgda_depth = max(2, int(getattr(config, 'pgda_depth', 2)))
-        pgda_state_chunk = getattr(config, 'pgda_state_chunk', 128)
+        cgca_depth = max(2, int(getattr(config, 'cgca_depth', 2)))
 
         self.ds_0 = CAGEStage(
             initial=True, predict=False,
             out_channel=128,
             k_num=9,
             sampling_rate=config.sr,
-            pgda_depth=pgda_depth,
+            cgca_depth=cgca_depth,
             cross_stage=False,
-            use_pgda=use_pgda,
+            use_cgca=use_cgca,
+            use_cgca_pre=use_cgca_pre,
+            use_cgca_post=use_cgca_post,
             use_msda=use_msda,
             use_gegr=use_gegr,
             use_rel=use_rel,
-            gate_mode=gate_mode,
-            pgda_state_chunk=pgda_state_chunk,
         )
 
         self.ds_1 = CAGEStage(
@@ -1000,14 +990,14 @@ class CAGENet(nn.Module):
             out_channel=128,
             k_num=6,
             sampling_rate=config.sr,
-            pgda_depth=pgda_depth,
+            cgca_depth=cgca_depth,
             cross_stage=use_csmf,
-            use_pgda=use_pgda,
+            use_cgca=use_cgca,
+            use_cgca_pre=use_cgca_pre,
+            use_cgca_post=use_cgca_post,
             use_msda=use_msda,
             use_gegr=use_gegr,
             use_rel=use_rel,
-            gate_mode=gate_mode,
-            pgda_state_chunk=pgda_state_chunk,
         )
 
         if use_csmf:
@@ -1047,5 +1037,3 @@ class CAGENet(nn.Module):
 
         return ws0 + ws1, [y, y, y1, y1, y2], [e_hat], y_hat
 
-
-FusedCLNet = CAGENet
